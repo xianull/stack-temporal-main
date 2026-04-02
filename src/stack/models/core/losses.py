@@ -18,8 +18,14 @@ class LossComputationMixin:
         targets: torch.Tensor,
         mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # nb_dist: NegativeBinomial分布，nb_mean: 均值，nb_dispersion: 方差
         nb_dist = NegativeBinomial(mu=nb_mean, theta=nb_dispersion)
+        
+        # recon_loss_all: 所有基因的负对数似然损失
+        # targets original_features (batch_size, n_cells, n_genes)
         recon_loss_all = -nb_dist.log_prob(targets)
+       
+       
         mask_f = mask.float()
         masked_count = mask_f.sum()
 

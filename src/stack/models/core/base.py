@@ -73,6 +73,8 @@ class StateICLModelBase(nn.Module):
 
         # 跳转至src/stack/modules/attention.py阅读TabularAttentionLayer的定义
         # 目前为止，x = (B, n_cells, n_hidden, token_dim) (64, 128, 100, 16)
+
+        # 定义n_layers个注意力层，每个注意力层都包含一个TabularAttentionLayer，TabularAttentionLayer的定义在src/stack/modules/attention.py中
         self.layers = nn.ModuleList(
             [
                 TabularAttentionLayer(
@@ -87,31 +89,40 @@ class StateICLModelBase(nn.Module):
             ]
         )
 
+        # 输入 -> Linear -> GELU -> Dropout -> Linear
+        # 用于compute_nb_parameters()
         self.output_mlp = nn.Sequential(
+            # (8192, 1600) --> (8192,3200)
             nn.Linear(n_hidden * token_dim, n_hidden * token_dim * 2),
             nn.GELU(),
             nn.Dropout(dropout),
+            # (8192,3200) --> (8192,n_genes * 2)
             nn.Linear(n_hidden * token_dim * 2, n_genes * 2),
         )
 
         self.apply(self._init_weights)
 
+    # 初始化权重，用于初始化模型参数
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
         elif isinstance(module, nn.LayerNorm):
+            # 初始化偏置为0，缩放项为1
             nn.init.constant_(module.bias, 0)
             nn.init.constant_(module.weight, 1.0)
         elif isinstance(module, nn.Embedding):
+            # 初始化权重为正态分布，均值为0，方差为0.2
             nn.init.normal_(module.weight, mean=0, std=0.2)
 
+    # 将n_genes降维到n_hidden * token_dim，然后reshape为(batch_size, n_cells, n_hidden, token_dim)
     def _reduce_and_tokenize(self, features: torch.Tensor) -> torch.Tensor:
         batch_size, n_cells, _ = features.shape
         reduced = self.gene_reduction(features)
         return reduced.reshape(batch_size, n_cells, self.n_hidden, self.token_dim)
 
+    # tokens: (batch_size, n_cells, n_hidden, token_dim)
     def _run_attention_layers(
         self,
         tokens: torch.Tensor,
@@ -119,46 +130,61 @@ class StateICLModelBase(nn.Module):
         return_attn: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Sequence[torch.Tensor]]]:
         attn_maps: List[torch.Tensor] = []
-        x = tokens
-        for layer in self.layers:
+        x = tokens # x: (batch_size, n_cells, n_hidden, token_dim)
+        for layer in self.layers: # layer: TabularAttentionLayer，参考src/stack/modules/attention.py中的TabularAttentionLayer的foward过程，同时计算cell-wise self-attention和gene-wise self-attention
             x, attn = layer(x, self.gene_pos_embedding, gene_attn_mask, return_attn)
             if return_attn:
                 attn_maps.append(attn)
-        if return_attn:
-            return x, attn_maps
-        return x
+                # attn: (batch_size, n_heads, n_cells, n_cells)
+        if return_attn: # 如果需要返回注意力图，则返回注意力图
+            return x, attn_maps # x: (batch_size, n_cells, n_hidden, token_dim)，attn_maps: List[torch.Tensor]，每个元素是(batch_size, n_heads, n_cells, n_cells) --> gene_attn（细胞间的注意力）
+        return x # 如果不需要返回注意力图，则返回计算后的特征
 
+    # 计算NB参数，输入为(batch_size, n_cells, n_hidden, token_dim)，输出为(batch_size, n_cells, n_genes, 2)，分别是mean, dispersion, px_scale
     def _compute_nb_parameters(
         self,
         final_cell_embeddings: torch.Tensor,
         observed_lib_size: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # final_cell_embeddings: (batch_size, n_cells, n_hidden * token_dim) --> (64, 128, 1600)
         batch_size, n_cells, _ = final_cell_embeddings.shape
-        flat_embeddings = final_cell_embeddings.reshape(batch_size * n_cells, -1)
-        output = self.output_mlp(flat_embeddings)
-        output = output.reshape(batch_size, n_cells, self.n_genes, 2)
+        flat_embeddings = final_cell_embeddings.reshape(batch_size * n_cells, -1) # flat_embeddings: (64 * 128, 1600) --> (8192, 1600)
+        # decoder，为每个gene输出两个参数：mean, dispersion
+        output = self.output_mlp(flat_embeddings) # (8192,1600) --> (8192,n_genes * 2)
+        output = output.reshape(batch_size, n_cells, self.n_genes, 2)  # output: (64, 128, n_genes, 2)
 
-        px_scale_logits = output[..., 0]
+        # 基因 $g$ 在该细胞中表达的相对强
+        px_scale_logits = output[..., 0] # output[b, c, g, 0]
+
+        # 基因 $g$ 在该细胞中表达的离散度 $\theta$ 
+        # 使用 softplus 是为了确保 $\theta$ 永远为正数
+        
+        # NB分布的方差：$\sigma^2 = \mu + \frac{\mu^2}{\theta}$
         nb_dispersion = F.softplus(output[..., 1])
+
+        # 表达比例，同一个细胞内所有基因的 px_scale 相加等于 1
         px_scale = F.softmax(px_scale_logits, dim=-1)
+
+        # NB分布的均值，代表模型预测的该基因真实的原始计数（Raw Counts）期望值
         nb_mean = px_scale * observed_lib_size
         return nb_mean, nb_dispersion, px_scale
 
     
     
     def apply_mask(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, n_cells, n_genes = features.shape
+        batch_size, n_cells, n_genes = features.shape # (B, n_cells, n_genes)
         device = features.device
 
+        # 随机生成一个mask比例，范围在mask_rate_min和mask_rate_max之间
         mask_rate = torch.empty(1, device=device).uniform_(
             self.mask_rate_min, self.mask_rate_max
         ).item()
-        n_genes_to_mask = int(n_genes * mask_rate)
+        n_genes_to_mask = int(n_genes * mask_rate) # 计算需要mask的基因数量
 
-        mask_indices = torch.randperm(n_genes, device=device)[:n_genes_to_mask]
+        mask_indices = torch.randperm(n_genes, device=device)[:n_genes_to_mask] # 随机生成需要mask的基因索引
 
         mask = torch.zeros(batch_size, n_cells, n_genes, dtype=torch.bool, device=device)
-        mask[:, :, mask_indices] = True
+        mask[:, :, mask_indices] = True # 将需要mask的基因索引位置设置为True
 
         masked_features = features.clone()
         masked_features[mask] = 0.0
@@ -166,6 +192,8 @@ class StateICLModelBase(nn.Module):
 
     def forward(
         self,
+
+        # features: (batch_size, n_cells, n_genes_原始) --> (64, 128, n_genes)
         features: torch.Tensor,
         return_loss: bool = True,
     ) -> Dict[str, torch.Tensor]:
@@ -173,15 +201,21 @@ class StateICLModelBase(nn.Module):
         device = features.device
 
         original_features = features.clone()
+
+        # observed_lib_size: (batch_size, n_cells, 1) --> (64, 128, 1)
+        # 求library size，即每个细胞的表达量之和
         observed_lib_size = original_features.sum(dim=-1, keepdim=True)
 
-        features = torch.log1p(features)
+        features = torch.log1p(features) # 对features进行log1p变换
 
-        masked_features, mask = self.apply_mask(features)
+        masked_features, mask = self.apply_mask(features) # 应用mask，得到masked_features和mask
 
-        tokens = self._reduce_and_tokenize(masked_features)
+        tokens = self._reduce_and_tokenize(masked_features) # 将masked_features降维到n_hidden * token_dim，然后reshape为(batch_size, n_cells, n_hidden, token_dim)
+
+        # 运行注意力层，输入为(batch_size, n_cells, n_hidden, token_dim)，输出为(batch_size, n_cells, n_hidden, token_dim)
         x = self._run_attention_layers(tokens)
-        final_cell_embeddings = x.reshape(batch_size, n_cells, -1)
+
+        final_cell_embeddings = x.reshape(batch_size, n_cells, -1) # final_cell_embeddings: (batch_size, n_cells, n_hidden * token_dim) --> (64, 128, 100 * 16) --> (64, 128, 1600)
 
         nb_mean, nb_dispersion, px_scale = self._compute_nb_parameters(
             final_cell_embeddings, observed_lib_size

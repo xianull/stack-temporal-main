@@ -60,6 +60,7 @@ class MultiHeadAttention(nn.Module):
         # 一次性算出来q,k,c；multi-head就是这里的
         q, k, v = qkv.permute(2, 0, 3, 1, 4) 
         # 变换后：(3, batch_size, n_heads, seq_len, head_dim) --> (3, 8192, 8, 100, 2)
+        # x_gene的q,k,v: (3, 64, 8, 128, 200)
         # 直接解包就可以得到q,k,v
         # self.qkv.weight：$$(3 \times d\_model, d\_model)$$
         
@@ -166,16 +167,19 @@ class TabularAttentionLayer(nn.Module):
         gene_attn_mask: Optional[torch.Tensor] = None,
         return_attn: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        batch_size, n_cells, n_genes, token_dim = x.shape
+        batch_size, n_cells, n_genes, token_dim = x.shape # batch_size: 64, n_cells: 128, n_genes: 100, token_dim: 16（注意，这里的n_genes是base中的n_hidden）
         # 将x的维度从(batch_size, n_cells, n_genes, token_dim) --> (batch_size * n_cells, n_genes, token_dim) --> (8192, 100, 16)
         x_cell = x.reshape(batch_size * n_cells, n_genes, token_dim)
 
-        # 这里可以看src/stack/models/core/base.py中的apply_mask函数，这里的gene_pos_emb是(n_hidden, token_dim) --> (100, 16)
+        # 这里可以看src/stack/models/core/base.py，这里的gene_pos_emb是(n_hidden, token_dim) --> (100, 16)
         x_cell_with_pos = x_cell + gene_pos_emb.unsqueeze(0)
-        cell_attn_out, _ = self.cell_attn(x_cell_with_pos)
+
         # 在我们计算的x的基础上，广播位置编码信息
-        x_cell = self.cell_norm(x_cell + cell_attn_out)
+        cell_attn_out, _ = self.cell_attn(x_cell_with_pos)
+       
         # 残差连接
+        x_cell = self.cell_norm(x_cell + cell_attn_out)
+        
         x = x_cell.reshape(batch_size, n_cells, n_genes, token_dim)
 
         # 细胞间注意力的输入：(B, n_cells, n_genes, token_dim) --> (B, n_cells, n_genes * token_dim) --> (64, 128, 100 * 16) --> (64, 128, 1600)
@@ -185,14 +189,21 @@ class TabularAttentionLayer(nn.Module):
             gene_attn_out, attn = self.gene_attn(x_gene, attn_mask=gene_attn_mask, return_attn=True)
         else:
             gene_attn_out, attn = self.gene_attn(x_gene, attn_mask=gene_attn_mask)
-        x_gene = self.gene_norm(x_gene + gene_attn_out)
+        
         # 残差连接
+        x_gene = self.gene_norm(x_gene + gene_attn_out)
+        
 
         x = x_gene.reshape(batch_size, n_cells, n_genes, token_dim)
-        mlp_input = x.reshape(-1, token_dim)
+
         # 特征压缩和提炼，(64, 128, 100, 16) --> (64 * 128 * 100, 16) --> (8192 * 100, 16) --> (819200, 16)
-        mlp_out = self.mlp(mlp_input)
+        mlp_input = x.reshape(-1, token_dim)
+        
         # 对每个基因的 16 维特征进行非线性映射（先扩充到 64 维再缩回 16 维）
+        mlp_out = self.mlp(mlp_input)
+
+        # 残差连接
         x = self.mlp_norm(mlp_input +  mlp_out).reshape(batch_size, n_cells, n_genes, token_dim)
 
-        return x, attn
+        # 这里的 x 是经过一个layers“每个 cell 的 token 表征”（已经融合了 cell 内 token 关系 + cell 间关系 + MLP 非线性变换）
+        return x, attn # x: (batch_size, n_cells, n_genes, token_dim)，attn: (batch_size, n_head, seq_len, seq_len)
